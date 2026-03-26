@@ -6,8 +6,8 @@
 // @author       Allison de Castro Silva
 // @match        https://eproc1g.tjmg.jus.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js
-// @updateURL    https://github.com/AllisondeCastro/Pesquisa-automatica-de-tutela-de-urgencia/edit/main/Busca%20Autom%C3%A1tica%20de%20Tutela%20de%20Urg%C3%AAncia.js
-// @downloadURL  https://github.com/AllisondeCastro/Pesquisa-automatica-de-tutela-de-urgencia/edit/main/Busca%20Autom%C3%A1tica%20de%20Tutela%20de%20Urg%C3%AAncia.js
+// @updateURL    https://raw.githubusercontent.com/AllisondeCastro/Pesquisa-automatica-de-tutela-de-urgencia/refs/heads/main/Busca%20Autom%C3%A1tica%20de%20Tutela%20de%20Urg%C3%AAncia.js
+// @downloadURL  https://raw.githubusercontent.com/AllisondeCastro/Pesquisa-automatica-de-tutela-de-urgencia/refs/heads/main/Busca%20Autom%C3%A1tica%20de%20Tutela%20de%20Urg%C3%AAncia.js
 // @grant        none
 // ==/UserScript==
 
