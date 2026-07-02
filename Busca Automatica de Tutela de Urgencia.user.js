@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Busca Automatica de Tutela de Urgencia
 // @namespace    http://tampermonkey.net/
-// @version      7.1
+// @version      8.0
 // @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore
 // @author       Allison de Castro Silva
 // @match        https://eproc1g.tjmg.jus.br/*
