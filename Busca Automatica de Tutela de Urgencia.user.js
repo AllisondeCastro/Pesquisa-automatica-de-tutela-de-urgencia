@@ -431,6 +431,10 @@
     let pdfButtonNode = null;
     let lastFoundCursor = null; // { page, charIndex } — cursor para busca sequencial
 
+    // ── Estado AJG: verificado uma única vez por PDF carregado ──
+    let ajgJaVerificado = false;  // true após a 1ª busca de tutela
+    let ajgEncontrado = null;     // null = não verificado | true = tem AJG | false = sem AJG
+
     // ===========================================================================================
     // DETECÇÃO DE PDF
     // ===========================================================================================
@@ -635,6 +639,166 @@
     }
 
     // ===========================================================================================
+    // MÓDULO AJG — VERIFICAÇÃO DE PEDIDO DE ASSISTÊNCIA JUDICIÁRIA GRATUITA
+    // (Independente da busca de tutela — roda uma vez, varre o PDF inteiro)
+    // ===========================================================================================
+
+    // Termos aceitos (serão normalizados sem acentos na comparação)
+    const ajgTermos = [
+        "assistencia judiciaria gratuita",
+        "assistencia juridica gratuita",
+        "assistencia judicial gratuita",
+        "justica gratuita",
+        "gratuidade da justica",
+        "gratuidade judicial",
+        "gratuidade de justica",
+        "gratuidade judiciaria",
+        "beneficio da gratuidade",
+        "ajg",
+        "sem prejuizo de seu sustento",
+        "sem prejuizo do sustento de sua familia",
+        "sem prejuizo de seu sustento e de sua familia"
+    ];
+
+    /**
+     * Varre TODAS as páginas do PDF em busca de qualquer termo de AJG.
+     * Retorna true se encontrou (tudo certo), false se não encontrou (alarmar).
+     * Em caso de erro/PDF protegido, retorna true (não alarma).
+     */
+    async function verificarAJGnoPDF(url) {
+        if (typeof pdfjsLib === 'undefined') return true;
+        try {
+            const cleanUrl = url.split('#')[0];
+            const loadingTask = pdfjsLib.getDocument({ url: cleanUrl, withCredentials: true });
+            const pdf = await loadingTask.promise;
+
+            // Monta regex com todos os termos
+            const ajgRegex = new RegExp(
+                '(' + ajgTermos.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')',
+                'i'
+            );
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+
+                const pageText = textContent.items
+                    .map(item => item.str)
+                    .join(' ')
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase();
+
+                if (ajgRegex.test(pageText)) return true; // AJG encontrado
+            }
+            return false; // Nenhuma página teve AJG
+        } catch(e) {
+            return true; // Erro silencioso — não alarma
+        }
+    }
+
+    /**
+     * Exibe o banner de resultado:
+     *   - Apenas banner laranja (AJG)
+     * O banner AJG fica fixo até o usuário fechar manualmente ou expirar o tempo (2.8s).
+     */
+    function exibirBannersAJG() {
+        // Remove container anterior se já existir
+        const anterior = document.getElementById('tm-ajg-banners');
+        if (anterior) anterior.remove();
+
+        // Keyframes (injetados apenas uma vez no documento)
+        if (!document.getElementById('tm-ajg-keyframes')) {
+            const st = document.createElement('style');
+            st.id = 'tm-ajg-keyframes';
+            st.textContent = [
+                '@keyframes tmAjgPulse{',
+                '0%,100%{box-shadow:0 8px 30px rgba(0,0,0,.4),0 0 0 0 rgba(255,120,0,.55)}',
+                '50%{box-shadow:0 8px 30px rgba(0,0,0,.4),0 0 0 10px rgba(255,120,0,0)}',
+                '}',
+                '@keyframes tmAjgShake{',
+                '0%,100%{transform:rotate(0)}',
+                '15%{transform:rotate(-12deg)}',
+                '30%{transform:rotate(12deg)}',
+                '45%{transform:rotate(-7deg)}',
+                '60%{transform:rotate(7deg)}',
+                '75%{transform:rotate(-3deg)}',
+                '}',
+                '@keyframes tmAjgIn{',
+                '0%{opacity:0;transform:translateX(-50%) translateY(-28px)}',
+                '100%{opacity:1;transform:translateX(-50%) translateY(0)}',
+                '}',
+                '@keyframes tmAjgOut{',
+                '0%{opacity:1;transform:translateX(-50%) translateY(0)}',
+                '100%{opacity:0;transform:translateX(-50%) translateY(-100px)}',
+                '}'
+            ].join('');
+            document.head.appendChild(st);
+        }
+
+        // Wrapper centralizado no topo (flex horizontal)
+        const wrap = document.createElement('div');
+        wrap.id = 'tm-ajg-banners';
+        wrap.style.cssText = [
+            'position:fixed','top:18px','left:50%',
+            'transform:translateX(-50%)',
+            'display:flex','gap:10px','align-items:flex-start',
+            'z-index:99999999',
+            'animation:tmAjgIn 0.4s cubic-bezier(0.16,1,0.3,1) forwards',
+            'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
+        ].join(';');
+
+        // ── Banner laranja (AJG ausente) ──
+        const bA = document.createElement('div');
+        bA.id = 'tm-banner-ajg';
+        bA.style.cssText = [
+            'background:linear-gradient(135deg,rgba(220,75,0,.97),rgba(165,42,0,.98))',
+            'border:2.5px solid rgba(255,190,60,.75)',
+            'border-radius:14px','padding:14px 20px',
+            'min-width:260px','max-width:360px',
+            'box-shadow:0 8px 30px rgba(0,0,0,.4),0 0 40px rgba(220,80,0,.35)',
+            'backdrop-filter:blur(12px)','-webkit-backdrop-filter:blur(12px)',
+            'color:#fff','animation:tmAjgPulse 1.6s ease-in-out infinite'
+        ].join(';');
+        bA.innerHTML = [
+            '<div style="display:flex;align-items:center;gap:12px;">',
+            '<span style="font-size:26px;flex-shrink:0;animation:tmAjgShake 2.2s ease-in-out infinite;',
+            'filter:drop-shadow(0 0 6px rgba(255,200,0,.6))">⚠️</span>',
+            '<div style="flex:1;">',
+            '<div style="font-size:9px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;',
+            'color:rgba(255,210,100,.9);margin-bottom:3px;">Atenção — Verificação AJG</div>',
+            '<div style="font-size:14px;font-weight:800;color:#FFE066;letter-spacing:-.01em;">',
+            'SEM pedido de Justiça Gratuita</div>',
+            '<div style="font-size:11px;font-weight:500;color:rgba(255,225,190,.85);margin-top:4px;line-height:1.4;">',
+            'Nenhum termo de AJG localizado<br>neste documento.</div>',
+            '</div>',
+            '<button id="tm-fechar-ajg" title="Fechar" style="background:transparent;border:none;',
+            'color:rgba(255,255,255,.45);font-size:20px;cursor:pointer;padding:0 2px;',
+            'line-height:1;flex-shrink:0;">✕</button>',
+            '</div>'
+        ].join('');
+        wrap.appendChild(bA);
+
+        document.body.appendChild(wrap);
+
+        // Função para fechar com animação de saída suave
+        function fecharBanner() {
+            if (!wrap.parentNode) return;
+            wrap.style.animation = 'tmAjgOut 0.45s cubic-bezier(0.16,1,0.3,1) forwards';
+            setTimeout(() => { if (wrap.parentNode) wrap.remove(); }, 450);
+        }
+
+        // Fechar ao clicar no X
+        document.getElementById('tm-fechar-ajg').addEventListener('click', function(e) {
+            e.stopPropagation();
+            fecharBanner();
+        });
+
+        // Fechar automaticamente após 3.8s (tempo similar ao da tutela de urgência + 2s)
+        setTimeout(fecharBanner, 3800);
+    }
+
+    // ===========================================================================================
     // BOTÃO FLUTUANTE DE BUSCA
     // ===========================================================================================
     function createBottomRightButton() {
@@ -653,8 +817,25 @@
             // Verificar se é uma busca sequencial (já tem resultado anterior)
             let isSequential = lastFoundCursor !== null;
 
+            // ── VERIFICAÇÃO AJG — roda apenas na PRIMEIRA busca de cada PDF ──
+            // Executa em paralelo com a busca de tutela para não atrasar a UX
+            let ajgPromise = null;
+            if (!ajgJaVerificado) {
+                ajgJaVerificado = true;
+                ajgPromise = verificarAJGnoPDF(currentPdfData.url);
+            }
+            // ────────────────────────────────────────────────────────────────
+
             // Usar cursor se existe resultado anterior (busca sequencial)
             let result = await searchPDF(currentPdfData.url, lastFoundCursor);
+
+            // ── Aguardar resultado AJG (se foi disparado) e decidir exibição ──
+            let ajgAusenteNestaAcao = false;
+            if (ajgPromise !== null) {
+                ajgEncontrado = await ajgPromise;
+                if (!ajgEncontrado) ajgAusenteNestaAcao = true;
+            }
+            // ────────────────────────────────────────────────────────────────
 
             if (result && result.match && !result.isJurisprudence) {
                 let msgTitulo = isSequential ? 'Próxima Ocorrência!' : 'Encontrado!';
@@ -673,6 +854,9 @@
 
                 // Salvar cursor para busca sequencial - página seguinte ao resultado atual
                 lastFoundCursor = { page: result.page, charIndex: (result.charIndex || 0) + 1 };
+
+                // Se AJG ausente nesta primeira busca: exibir banner laranja
+                if (ajgAusenteNestaAcao) exibirBannersAJG();
 
                 if (currentPdfData.element) {
                     let baseUrl = currentPdfData.url.split('#')[0];
@@ -729,11 +913,16 @@
                 if (isSequential) {
                     lastFoundCursor = { page: result.page, charIndex: (result.charIndex || 0) + 1 };
                 }
+                // Se AJG ausente na primeira busca: exibir apenas banner laranja
+                if (ajgAusenteNestaAcao) exibirBannersAJG();
 
             } else if (result && result.error) {
                 showPopup('❌', 'Erro', result.error, null, 'error');
                 btn.classList.remove('btn-lendo');
                 btn.innerHTML = '⚠️';
+                // Se AJG ausente na primeira busca: exibir apenas banner laranja
+                if (ajgAusenteNestaAcao) exibirBannersAJG();
+
             } else if (result && result.notFound) {
                 if (isSequential) {
                     showPopup('🔚', 'Fim da Busca', 'Não há mais ocorrências de tutela no documento. Clique para reiniciar a busca.', null, 'error');
@@ -746,6 +935,8 @@
                     showPopup('❌', 'Não Encontrado', 'Nenhum pedido de tutela foi encontrado neste documento.', null, 'error');
                     btn.classList.remove('btn-lendo');
                     btn.innerHTML = '⚠️';
+                    // Se AJG ausente na primeira busca: exibir apenas banner laranja
+                    if (ajgAusenteNestaAcao) exibirBannersAJG();
                 }
             }
         };
