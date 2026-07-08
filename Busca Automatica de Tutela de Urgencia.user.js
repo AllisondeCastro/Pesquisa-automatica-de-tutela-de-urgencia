@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Busca Automatica de Tutela de Urgencia
 // @namespace    http://tampermonkey.net/
-// @version      8.0
+// @version      8.1
 // @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore
 // @author       Allison de Castro Silva
 // @match        https://eproc1g.tjmg.jus.br/*
@@ -672,9 +672,9 @@
             const loadingTask = pdfjsLib.getDocument({ url: cleanUrl, withCredentials: true });
             const pdf = await loadingTask.promise;
 
-            // Monta regex com todos os termos
+            // Monta regex com todos os termos (removendo espaços e pontuações para ignorar formatação do PDF)
             const ajgRegex = new RegExp(
-                '(' + ajgTermos.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')',
+                '(' + ajgTermos.map(t => t.replace(/[^a-z0-9]/gi, '').toLowerCase()).join('|') + ')',
                 'i'
             );
 
@@ -684,9 +684,10 @@
 
                 const pageText = textContent.items
                     .map(item => item.str)
-                    .join(' ')
+                    .join('') // Junta tudo para evitar problemas de palavras divididas
                     .normalize('NFD')
-                    .replace(/[\u0300-\u036f]/g, '')
+                    .replace(/[\u0300-\u036f]/g, '') // Remove acentos
+                    .replace(/[^a-z0-9]/gi, '') // Remove todos os espaços, hífens e pontuações
                     .toLowerCase();
 
                 if (ajgRegex.test(pageText)) return true; // AJG encontrado
