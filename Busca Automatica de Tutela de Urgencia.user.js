@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Busca Automatica de Tutela de Urgencia
 // @namespace    http://tampermonkey.net/
-// @version      8.1
+// @version      8.4
 // @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore
 // @author       Allison de Castro Silva
 // @match        https://eproc1g.tjmg.jus.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js
+// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js
 // @updateURL    https://github.com/AllisondeCastro/Pesquisa-automatica-de-tutela-de-urgencia/raw/refs/heads/main/Busca%20Automatica%20de%20Tutela%20de%20Urgencia.user.js
 // @downloadURL  https://github.com/AllisondeCastro/Pesquisa-automatica-de-tutela-de-urgencia/raw/refs/heads/main/Busca%20Automatica%20de%20Tutela%20de%20Urgencia.user.js
 // @grant        none
@@ -231,6 +232,27 @@
             background: linear-gradient(90deg, rgba(239,83,80,0.6), rgba(255,205,210,0.3));
             animation: tutela-progress-bar 3.2s linear forwards;
         }
+        @keyframes tutela-hourglass-spin {
+            0% { transform: rotate(0deg) scale(1); }
+            50% { transform: rotate(180deg) scale(1.18); }
+            100% { transform: rotate(360deg) scale(1); }
+        }
+        #popup-tutela-resultado.popup-ocr {
+            background: linear-gradient(160deg, rgba(80, 50, 10, 0.92), rgba(45, 25, 5, 0.9));
+            border-color: rgba(255, 193, 7, 0.45);
+            box-shadow:
+                0 24px 80px rgba(0,0,0,0.5),
+                0 0 60px rgba(255, 193, 7, 0.25),
+                inset 0 1px 0 rgba(255,255,255,0.15);
+        }
+        #popup-tutela-resultado.popup-ocr .popup-icon {
+            display: inline-block;
+            animation: tutela-hourglass-spin 1.6s cubic-bezier(0.68, -0.55, 0.27, 1.55) infinite !important;
+            filter: drop-shadow(0 0 10px rgba(255, 200, 0, 0.8));
+        }
+        #popup-tutela-resultado.popup-ocr .popup-timer-bar {
+            display: none;
+        }
         #popup-tutela-resultado.popup-fadeout {
             animation: tutela-popup-out 0.35s cubic-bezier(0.4, 0, 1, 1) forwards;
         }
@@ -404,7 +426,7 @@
     const keywords =[
         "antecipacao de tutela", "antecipacao da tutela", "tutela antecipada",
         "inaudita altera pars", "altera pars", "pedido liminar", "liminar",
-        "liminares", "antecipacao dos efeitos", "tutela de urgencia", "tutela provisoria", "art. 300", "artigo 300"
+        "liminares", "antecipacao dos efeitos", "tutela de urgencia", "tutela mandamental de urgencia", "carater antecedente", "tutela provisoria", "art. 300", "artigo 300"
     ];
 
     const positiveWords =[
@@ -434,6 +456,10 @@
     // ── Estado AJG: verificado uma única vez por PDF carregado ──
     let ajgJaVerificado = false;  // true após a 1ª busca de tutela
     let ajgEncontrado = null;     // null = não verificado | true = tem AJG | false = sem AJG
+
+    // ── Cache de OCR por PDF carregado (para navegação rápida em cliques repetidos) ──
+    let ocrCacheData = null;      // { totalChars, ajgEncontrado, tutelaMatch, pages }
+    let ocrEmAndamento = null;    // Promessa de OCR em execução para evitar chamadas duplicadas
 
     // ===========================================================================================
     // DETECÇÃO DE PDF
@@ -467,23 +493,293 @@
     }
 
     // ===========================================================================================
+    // MATCHER TOLERANTE — ignora espaçamento entre letras (ex.: "t u t e l a") e pequenas
+    // corrupções de acentuação/OCR (ex.: "urgÍncia" no lugar de "urgência")
+    // ===========================================================================================
+    const cacheTokens = new Map();
+    function tokensDe(padrao) {
+        if (cacheTokens.has(padrao)) return cacheTokens.get(padrao);
+        const t = padrao.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+        const toks = [];
+        for (const ch of t) {
+            if (/[a-z0-9]/.test(ch)) toks.push({ tipo: 'ch', ch, risco: /[aeiou]/.test(ch) || ch === 'c' });
+            else toks.push({ tipo: 'sep' });
+        }
+        cacheTokens.set(padrao, toks);
+        return toks;
+    }
+    function limiteDe(toks) { return toks.length <= 10 ? 1 : 2; }
+    function ehAlnum(c) { return c !== undefined && /[a-z0-9]/.test(c); }
+
+    function casaEm(texto, ini, toks, limite) {
+        function rec(ti, hi, usados) {
+            if (ti >= toks.length) return { fim: hi, usados: usados };
+            if (usados > limite) return null;
+            const tok = toks[ti];
+            if (tok.tipo === 'ch') {
+                let p = hi;
+                while (p < texto.length && (texto[p] === ' ' || texto[p] === '\t')) p++;
+                if (p >= texto.length) return null;
+                const h = texto[p];
+                if (h === tok.ch) {
+                    const r = rec(ti + 1, p + 1, usados);
+                    if (r) return r;
+                }
+                if (tok.risco) {
+                    if (h !== ' ' && h !== '\t') {
+                        const r = rec(ti + 1, p + 1, usados + 1);
+                        if (r) return r;
+                    }
+                    const r2 = rec(ti + 1, p, usados + 1);
+                    if (r2) return r2;
+                }
+                return null;
+            } else {
+                let q = hi;
+                while (q < texto.length && !/[a-z0-9]/.test(texto[q])) q++;
+                const r = rec(ti + 1, q, usados);
+                if (r) return r;
+                if (q > hi) {
+                    const r2 = rec(ti + 1, hi, usados);
+                    if (r2) return r2;
+                }
+                return null;
+            }
+        }
+        return rec(0, ini, 0);
+    }
+
+    // Retorna as ocorrências do termo a partir de `desde`. `limiteOverride` (null = automático)
+    // controla a quantidade de edições permitidas: 0 = apenas espaçamento entre letras.
+    function buscarTolerante(texto, padrao, desde, maxMatches, limiteOverride) {
+        const toks = tokensDe(padrao);
+        if (!toks.length) return [];
+        const limite = (limiteOverride === undefined || limiteOverride === null) ? limiteDe(toks) : limiteOverride;
+        const out = [];
+        let i = Math.max(0, desde | 0);
+        while (i < texto.length && out.length < maxMatches) {
+            if (texto[i] === ' ' || texto[i] === '\t') { i++; continue; }
+            const inicioValido = !ehAlnum(texto[i - 1]);
+            if (inicioValido && (texto[i] === toks[0].ch || toks[0].risco)) {
+                const m = casaEm(texto, i, toks, limite);
+                if (m && !ehAlnum(texto[m.fim])) {
+                    out.push({ index: i, fim: m.fim, edits: m.usados });
+                    i = Math.max(m.fim, i + 1);
+                    continue;
+                }
+            }
+            i++;
+        }
+        return out;
+    }
+
+    function existeTolerante(texto, padrao, limite) {
+        return buscarTolerante(texto, padrao, 0, 1, (limite === undefined ? null : limite)).length > 0;
+    }
+
+    /**
+     * Utiliza a busca nativa do navegador (window.find), a qual aciona o motor de OCR nativo
+     * integrado no Chrome/Edge em PDFs digitalizados (o mesmo mecanismo ativado pelo Ctrl+F).
+     */
+    function buscarTextoNativoNavegador(termo) {
+        try {
+            if (typeof window === 'undefined' || typeof window.find !== 'function') return false;
+
+            const sel = window.getSelection ? window.getSelection() : null;
+            const ranges = [];
+            if (sel && sel.rangeCount > 0) {
+                for (let i = 0; i < sel.rangeCount; i++) {
+                    ranges.push(sel.getRangeAt(i).cloneRange());
+                }
+            }
+
+            // window.find(aString, aCaseSensitive, aBackwards, aWrapAround, aWholeWord, aSearchInFrames, aShowDialog)
+            const encontrou = window.find(termo, false, false, true, false, true, false);
+
+            if (sel) {
+                sel.removeAllRanges();
+                ranges.forEach(r => sel.addRange(r));
+            }
+
+            return encontrou;
+        } catch(e) {
+            return false;
+        }
+    }
+
+    /**
+     * Extrai o texto dos elementos DOM/iframes renderizados pelo leitor do navegador.
+     */
+    function extrairTextoDosFrames() {
+        let textoTotal = "";
+        try {
+            const frames = document.querySelectorAll('iframe, frame, embed, object');
+            frames.forEach(f => {
+                try {
+                    const doc = f.contentDocument || f.contentWindow?.document;
+                    if (doc && doc.body) {
+                        textoTotal += " " + (doc.body.innerText || doc.body.textContent || "");
+                    }
+                } catch(e) {}
+            });
+        } catch(e) {}
+        return textoTotal;
+    }
+
+    /**
+     * Obter a instância do Tesseract.js (pré-carregada via @require ou dinâmica).
+     */
+    async function obterTesseract() {
+        if (typeof Tesseract !== 'undefined') return Tesseract;
+        if (typeof window !== 'undefined' && window.Tesseract) return window.Tesseract;
+        return new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+            script.onload = () => resolve(window.Tesseract);
+            script.onerror = () => reject(new Error('Falha ao carregar Tesseract.js'));
+            document.head.appendChild(script);
+        });
+    }
+
+    function fecharPopupResultado() {
+        let existing = document.getElementById('popup-tutela-resultado');
+        if (existing) {
+            existing.classList.add('popup-fadeout');
+            setTimeout(() => { if (existing.parentNode) existing.remove(); }, 300);
+        }
+    }
+
+    /**
+     * Executa OCR via Tesseract.js nas páginas do PDF (renderizando offscreen canvas).
+     * O resultado é MEMORIZADO em `ocrCacheData` para que cliques repetidos pesquisem instantaneamente!
+     */
+    async function executarOCRnoPDF(pdf) {
+        if (ocrCacheData) return ocrCacheData;
+        if (ocrEmAndamento) return await ocrEmAndamento;
+
+        ocrEmAndamento = (async () => {
+            try {
+                // Exibe notificação clean e objetiva com ampulheta animada
+                showPopup(
+                    '⏳',
+                    'Reconhecendo Caracteres do Texto',
+                    'Documento digitalizado ou sem caracteres visíveis<br><b>Aguarde a leitura...</b>',
+                    null,
+                    'ocr'
+                );
+
+                const tess = await obterTesseract();
+                if (!tess) {
+                    fecharPopupResultado();
+                    return { totalChars: 0, ajgEncontrado: false, tutelaMatch: null, pages: [] };
+                }
+
+                const worker = await tess.createWorker('por');
+
+                let ajgEncontrado = false;
+                let tutelaMatch = null;
+                let totalChars = 0;
+                const pagesCache = [];
+
+                for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                    const page = await pdf.getPage(pageNum);
+                    const viewport = page.getViewport({ scale: 1.2 });
+                    const canvas = document.createElement('canvas');
+                    canvas.width = viewport.width;
+                    canvas.height = viewport.height;
+                    const ctx = canvas.getContext('2d');
+
+                    await page.render({ canvasContext: ctx, viewport }).promise;
+
+                    const { data: { text } } = await worker.recognize(canvas);
+                    const rawText = text || '';
+                    const textNorm = rawText.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+                    totalChars += textNorm.length;
+
+                    pagesCache.push({
+                        pageNum: pageNum,
+                        rawText: rawText,
+                        textNorm: textNorm
+                    });
+
+                    // Verificar AJG
+                    if (!ajgEncontrado) {
+                        for (const termo of ajgTermos) {
+                            const termoNorm = termo.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+                            if (textNorm.includes(termoNorm)) {
+                                ajgEncontrado = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Verificar Tutela de Urgência
+                    if (!tutelaMatch) {
+                        for (const kw of keywords) {
+                            const kwNorm = kw.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+                            if (textNorm.includes(kwNorm)) {
+                                tutelaMatch = { match: kw, page: pageNum, score: 10, charIndex: 0 };
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                await worker.terminate();
+
+                ocrCacheData = {
+                    totalChars: totalChars,
+                    ajgEncontrado: ajgEncontrado,
+                    tutelaMatch: tutelaMatch,
+                    pages: pagesCache
+                };
+
+                fecharPopupResultado();
+                return ocrCacheData;
+            } catch(e) {
+                console.error("Erro ao executar OCR no PDF:", e);
+                fecharPopupResultado();
+                return { totalChars: 0, ajgEncontrado: false, tutelaMatch: null, pages: [] };
+            } finally {
+                ocrEmAndamento = null;
+            }
+        })();
+
+        return await ocrEmAndamento;
+    }
+
+    // Conta apenas hífens que não estão entre letras (números/citações), ignorando
+    // hífens de palavra ("confirmando-se"), que poluem a pontuação.
+    function hifensRelevantes(context) {
+        let n = 0;
+        for (let i = 0; i < context.length; i++) {
+            if (context[i] !== '-') continue;
+            const antes = context[i - 1], depois = context[i + 1];
+            const letraAntes = antes !== undefined && /\p{L}/u.test(antes);
+            const letraDepois = depois !== undefined && /\p{L}/u.test(depois);
+            if (!(letraAntes && letraDepois)) n++;
+        }
+        return n;
+    }
+
+    // ===========================================================================================
     // ANÁLISE DE SCORE
     // ===========================================================================================
     function calculateScore(context) {
         let score = 0;
-        let hyphenCount = (context.match(/-/g) ||[]).length;
-        if (hyphenCount >= 4) score -= 15;
+        if (hifensRelevantes(context) >= 4) score -= 15;
 
         let cleanContext = context.replace(/[-_.,;()""''[\]{}]/g, " ").replace(/\s+/g, " ");
 
+        // Palavras positivas: tolerância total (capturam texto com acento corrompido)
         positiveWords.forEach(word => {
-            let rx = new RegExp(`\\b${word}\\b`, 'i');
-            if (rx.test(cleanContext)) score += 10;
+            if (existeTolerante(cleanContext, word)) score += 10;
         });
 
+        // Palavras negativas (guardas de jurisprudência): apenas espaçamento entre letras,
+        // sem substituições — evita falsos acertos como "ementa" casando com "mente"
         negativeWords.forEach(word => {
-            let rx = new RegExp(`\\b${word}\\b`, 'i');
-            if (rx.test(cleanContext)) score -= 20;
+            if (existeTolerante(cleanContext, word, 0)) score -= 20;
         });
 
         return score;
@@ -502,9 +798,11 @@
             const pdf = await loadingTask.promise;
             const maxPages = pdf.numPages;
 
-            const regex = new RegExp(`\\b(${keywords.join('|')})\\b`, 'gi');
             const startPage = cursor ? cursor.page : 1;
             const startCharAfter = cursor ? cursor.charIndex : -1;
+
+            let totalTextItems = 0;
+            let totalTextChars = 0;
 
             // Função que analisa uma página e retorna matches válidos
             async function analyzePage(pageNum, skipBefore) {
@@ -517,6 +815,7 @@
 
                 textContent.items.forEach(item => {
                     if (!item.str.trim()) return;
+                    totalTextItems++;
                     let normalizedStr = item.str.replace(/\s+/g, ' ') + " ";
                     let startIdx = searchableText.length;
                     let cleanStr = normalizedStr.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -525,9 +824,12 @@
                     textNodes.push({
                         start: startIdx, end: searchableText.length,
                         size: Math.abs(item.transform[3] || item.height || 0),
-                        x: item.transform[4] || 0
+                        x: item.transform[4] || 0,
+                        y: item.transform[5] || 0
                     });
                 });
+
+                totalTextChars += searchableText.length;
 
                 let sizeCounts = {}, xCounts = {};
                 textNodes.forEach(n => {
@@ -544,35 +846,57 @@
                 if (Object.keys(xCounts).length > 0)
                     mainXPos = parseInt(Object.keys(xCounts).reduce((a, b) => xCounts[a] > xCounts[b] ? a : b));
 
-                const matches = [...searchableText.matchAll(regex)];
-                let bestMatch = null;
+                // X mínimo de cada linha (por y arredondado): só texto que INICIA a linha
+                // é candidato à penalidade de margem — texto no meio da linha é prosa comum.
+                let lineMin = {};
+                textNodes.forEach(n => {
+                    let y = Math.round(n.y);
+                    if (lineMin[y] === undefined || n.x < lineMin[y]) lineMin[y] = n.x;
+                });
 
-                for (const match of matches) {
-                    // Pular matches antes do cursor (na mesma página)
-                    if (skipBefore >= 0 && match.index <= skipBefore) continue;
+                // Busca tolerante de todas as keywords, ordenada por posição e sem sobreposição
+                let found = [];
+                keywords.forEach(kw => {
+                    buscarTolerante(searchableText, kw, Math.max(0, skipBefore + 1), 60)
+                        .forEach(m => found.push({ index: m.index, fim: m.fim, kw: kw }));
+                });
+                found.sort((a, b) => (a.index - b.index) || ((b.fim - b.index) - (a.fim - a.index)));
+
+                let bestMatch = null;
+                let lastFim = -1;
+
+                for (const match of found) {
+                    // Ignora ocorrência que se sobrepõe à última aceita
+                    // (ex.: "liminar" dentro de "pedido liminar" — mesma passagem do texto)
+                    if (match.index < lastFim) continue;
 
                     let startIndex = Math.max(0, match.index - 300);
-                    let endIndex = Math.min(searchableText.length, match.index + match[0].length + 300);
+                    let endIndex = Math.min(searchableText.length, match.fim + 300);
                     let context = searchableText.substring(startIndex, endIndex);
                     let score = calculateScore(context);
 
-                    let exactMatch = originalText.substring(match.index, match.index + match[0].length);
+                    let exactMatch = originalText.substring(match.index, match.fim);
                     if (exactMatch === exactMatch.toUpperCase() && exactMatch.length > 5) score += 15;
 
                     let matchedNode = textNodes.find(n => match.index >= n.start && match.index < n.end);
                     if (matchedNode) {
                         if (matchedNode.size < mainFontSize * 0.85) score -= 40;
-                        if (matchedNode.x > mainXPos + 80) score -= 30;
+                        const minX = lineMin[Math.round(matchedNode.y)];
+                        const iniciaLinha = (minX === undefined) || (matchedNode.x <= minX + 2);
+                        if (iniciaLinha && matchedNode.x > mainXPos + 80) score -= 30;
                     }
+
+                    lastFim = match.fim;
 
                     // Na busca sequencial, pegar o PRIMEIRO match válido (score >= 0)
                     if (score >= 0) {
-                        return { match: exactMatch, page: pageNum, score: score, charIndex: match.index };
+                        // charIndex = fim da ocorrência: a próxima busca parte dali (evita repetir)
+                        return { match: exactMatch, page: pageNum, score: score, charIndex: Math.max(0, match.fim - 1) };
                     }
 
                     // Guardar o melhor match negativo como fallback
                     if (!bestMatch || score > bestMatch.score) {
-                        bestMatch = { match: exactMatch, page: pageNum, score: score, charIndex: match.index };
+                        bestMatch = { match: exactMatch, page: pageNum, score: score, charIndex: Math.max(0, match.fim - 1) };
                     }
                 }
                 return bestMatch; // pode ser null se não houver match nesta página
@@ -594,6 +918,26 @@
 
                 // Se completou o wrap-around e voltou à página antes do cursor
                 if (cursor && pageNum === startPage && i > 0) break;
+            }
+
+            // Se nenhuma página extraiu texto pesquisável (PDF contendo apenas imagens ou digitalizado),
+            // executa o OCR via Tesseract.js diretamente sobre o canvas renderizado da página.
+            if (totalTextItems === 0 || totalTextChars < 30) {
+                for (const kw of keywords) {
+                    if (buscarTextoNativoNavegador(kw)) {
+                        return { match: kw, page: 1, score: 10, charIndex: 0 };
+                    }
+                }
+                const resOCR = await executarOCRnoPDF(pdf);
+                if (resOCR && resOCR.tutelaMatch) {
+                    return resOCR.tutelaMatch;
+                }
+                // Se o OCR foi executado com sucesso e reconheceu caracteres (totalChars >= 30),
+                // significa que o documento FOI LIDO com sucesso, e a ausência de match indica apenas "Não Encontrado".
+                if (resOCR && resOCR.totalChars >= 30) {
+                    return { notFound: true, viaOCR: true };
+                }
+                return { isUnreadable: true };
             }
 
             if (bestOverall) {
@@ -631,11 +975,13 @@
 
         document.body.appendChild(popup);
 
-        let timeout = (type === 'success') ? 1800 : 3200;
-        setTimeout(() => {
-            popup.classList.add('popup-fadeout');
-            setTimeout(() => { if (popup.parentNode) popup.remove(); }, 300);
-        }, timeout);
+        if (type !== 'ocr') {
+            let timeout = (type === 'success') ? 3600 : 6400; // Dobro do tempo de exibição (3.6s / 6.4s)
+            setTimeout(() => {
+                popup.classList.add('popup-fadeout');
+                setTimeout(() => { if (popup.parentNode) popup.remove(); }, 300);
+            }, timeout);
+        }
     }
 
     // ===========================================================================================
@@ -644,45 +990,142 @@
     // ===========================================================================================
 
     // Termos aceitos (serão normalizados sem acentos na comparação)
+    // Termos aceitos para busca de AJG (no PDF e na Árvore de Documentos)
     const ajgTermos = [
         "assistencia judiciaria gratuita",
         "assistencia juridica gratuita",
         "assistencia judicial gratuita",
+        "assistencia judiciaria",
+        "assistencia juridica",
+        "assistencia judicial",
         "justica gratuita",
         "gratuidade da justica",
-        "gratuidade judicial",
         "gratuidade de justica",
+        "gratuidade judicial",
         "gratuidade judiciaria",
         "beneficio da gratuidade",
+        "beneficio da assistencia",
         "ajg",
+        "hipossuficiencia",
+        "hipossuficiente",
+        "miserabilidade",
+        "comprovante de renda",
+        "comprovante de rendimentos",
+        "declaracao de hipossuficiencia",
+        "declaracao de pobreza",
+        "isencao de custas",
+        "dispensa de custas",
         "sem prejuizo de seu sustento",
         "sem prejuizo do sustento de sua familia",
         "sem prejuizo de seu sustento e de sua familia"
     ];
 
     /**
-     * Varre TODAS as páginas do PDF em busca de qualquer termo de AJG.
-     * Retorna true se encontrou (tudo certo), false se não encontrou (alarmar).
-     * Em caso de erro/PDF protegido, retorna true (não alarma).
+     * Varre a Árvore de Documentos (#divArvore) em busca de termos de AJG / Hipossuficiência / Assistência Jurídica.
+     * Procura no documento atual, window.top, window.parent e em todos os frames acessíveis do eproc.
+     */
+    function verificarAJGnaArvore() {
+        try {
+            const tentarEncontrar = (win) => {
+                if (!win) return null;
+                try {
+                    const doc = win.document;
+                    if (!doc) return null;
+                    let el = doc.getElementById('divArvore') || doc.querySelector('#divArvore, .jstree, [id*="Arvore"]');
+                    if (el) return el;
+                } catch(e) {}
+                return null;
+            };
+
+            let elArvore = tentarEncontrar(window) || tentarEncontrar(window.top) || tentarEncontrar(window.parent);
+
+            if (!elArvore) {
+                try {
+                    const frames = (window.top || window).frames;
+                    for (let i = 0; i < frames.length; i++) {
+                        elArvore = tentarEncontrar(frames[i]);
+                        if (elArvore) break;
+                    }
+                } catch(e) {}
+            }
+
+            if (!elArvore) return false;
+
+            const textoArvore = (elArvore.innerText || elArvore.textContent || '')
+                .normalize("NFD")
+                .replace(/[\u0300-\u036f]/g, "")
+                .toLowerCase();
+
+            if (!textoArvore.trim()) return false;
+
+            for (const termo of ajgTermos) {
+                const termoNorm = termo.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+                if (textoArvore.includes(termoNorm)) return true;
+                if (buscarTolerante(textoArvore, termoNorm, 0, 1).length > 0) return true;
+            }
+        } catch(e) {
+            console.error("Erro ao verificar AJG na Árvore de Documentos:", e);
+        }
+        return false;
+    }
+
+    /**
+     * Realiza a verificação completa de AJG:
+     * 1) Checa a Árvore de Documentos (#divArvore).
+     * 2) Checa o texto renderizado nos frames/DOM pelo leitor do navegador.
+     * 3) Utiliza o mecanismo de busca/OCR nativo do navegador via window.find (mesmo motor do Ctrl+F).
+     * 4) Varre as páginas do PDF via PDF.js.
+     * 5) Em caso de PDF digitalizado sem camada de texto, evita falso alarme (retorna true).
      */
     async function verificarAJGnoPDF(url) {
+        // Passo 1: Verificar se a Árvore de Documentos no eproc possui pedido/documento de AJG
+        if (verificarAJGnaArvore()) return true;
+
+        // Passo 2: Extração de texto dos elementos renderizados nos frames/DOM (ex.: leitor PDF)
+        const textoFrames = extrairTextoDosFrames().normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+        if (textoFrames.trim()) {
+            for (const termo of ajgTermos) {
+                const termoNorm = termo.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+                if (textoFrames.includes(termoNorm) || buscarTolerante(textoFrames, termoNorm, 0, 1).length > 0) {
+                    return true;
+                }
+            }
+        }
+
+        // Passo 3: Utilizar motor de busca/OCR nativo do navegador via window.find (mesmo mecanismo do Ctrl+F)
+        const termosNativos = [
+            "justiça gratuita", "justica gratuita", "gratuidade da justiça", "gratuidade da justica",
+            "assistência judiciária", "assistencia judiciaria", "assistência jurídica", "assistencia juridica",
+            "hipossuficiência", "hipossuficiencia", "ajg"
+        ];
+        for (const t of termosNativos) {
+            if (buscarTextoNativoNavegador(t)) return true;
+        }
+
+        // Passo 4: Varredura via PDF.js
         if (typeof pdfjsLib === 'undefined') return true;
         try {
             const cleanUrl = url.split('#')[0];
             const loadingTask = pdfjsLib.getDocument({ url: cleanUrl, withCredentials: true });
             const pdf = await loadingTask.promise;
 
-            // Monta regex com todos os termos (removendo espaços e pontuações para ignorar formatação do PDF)
             const ajgRegex = new RegExp(
                 '(' + ajgTermos.map(t => t.replace(/[^a-z0-9]/gi, '').toLowerCase()).join('|') + ')',
                 'i'
             );
 
+            let totalTextItems = 0;
+            let totalTextCharCount = 0;
+
             for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
                 const page = await pdf.getPage(pageNum);
                 const textContent = await page.getTextContent();
+                const itens = textContent.items.filter(item => item.str && item.str.trim());
 
-                const pageText = textContent.items
+                totalTextItems += itens.length;
+
+                // 1) Passo original: tudo junto e sem pontuação (pega palavras divididas entre itens)
+                const pageText = itens
                     .map(item => item.str)
                     .join('') // Junta tudo para evitar problemas de palavras divididas
                     .normalize('NFD')
@@ -690,9 +1133,32 @@
                     .replace(/[^a-z0-9]/gi, '') // Remove todos os espaços, hífens e pontuações
                     .toLowerCase();
 
+                totalTextCharCount += pageText.length;
+
                 if (ajgRegex.test(pageText)) return true; // AJG encontrado
+
+                // 2) Passo tolerante: texto com espaços, ignorando espaçamento entre letras
+                //    (ex.: "j u s t i ç a") e pequenas corrupções de acentuação (ex.: "justia")
+                const pageTextEspacos = itens
+                    .map(item => item.str.replace(/\s+/g, ' ') + ' ')
+                    .join('')
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase();
+
+                for (const termo of ajgTermos) {
+                    if (buscarTolerante(pageTextEspacos, termo, 0, 1).length > 0) return true;
+                }
             }
-            return false; // Nenhuma página teve AJG
+
+            // Fallback para PDFs digitalizados (sem camada de texto): executa OCR via Tesseract.js nas páginas do PDF
+            if (totalTextItems === 0 || totalTextCharCount < 30) {
+                const resOCR = await executarOCRnoPDF(pdf);
+                if (resOCR && resOCR.ajgEncontrado) return true;
+                return true;
+            }
+
+            return false; // Nenhuma página teve AJG e a árvore também não
         } catch(e) {
             return true; // Erro silencioso — não alarma
         }
@@ -898,6 +1364,19 @@
                     }
                 }
 
+            } else if (result && result.isUnreadable) {
+                showPopup(
+                    '📷',
+                    'Documento Digitalizado',
+                    'O arquivo contém apenas <b>imagem</b> ou <b>caracteres não legíveis</b>.',
+                    'Não é possível realizar busca de texto neste PDF.',
+                    'jurisprudence'
+                );
+                btn.classList.remove('btn-lendo');
+                btn.innerHTML = '📷';
+                btn.title = 'Documento digitalizado / imagem (sem camada de texto)';
+                if (ajgAusenteNestaAcao) exibirBannersAJG();
+
             } else if (result && result.isJurisprudence) {
                 showPopup(
                     '⚖️',
@@ -964,6 +1443,8 @@
         if (isNewPdf) {
             currentPdfData = pdfData;
             lastFoundCursor = null; // Reset cursor ao trocar de PDF
+            ajgJaVerificado = false; // Reset AJG: novo PDF = nova verificação de AJG
+            ajgEncontrado = null;
             if (pdfButtonShown && pdfButtonNode) pdfButtonNode.remove();
             pdfButtonNode = createBottomRightButton();
             pdfButtonShown = true;
