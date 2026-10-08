@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Busca Automatica de Tutela de Urgencia
 // @namespace    http://tampermonkey.net/
-// @version      8.4
-// @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore
+// @version      8.5
+// @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore + OCR nativo em PDFs digitalizados com cache de cliques
 // @author       Allison de Castro Silva
 // @match        https://eproc1g.tjmg.jus.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js
@@ -206,7 +206,7 @@
         }
         #popup-tutela-resultado.popup-success .popup-timer-bar {
             background: linear-gradient(90deg, rgba(129,199,132,0.6), rgba(200,230,201,0.3));
-            animation: tutela-progress-bar 1.8s linear forwards;
+            animation: tutela-progress-bar 0.9s linear forwards;
         }
         #popup-tutela-resultado.popup-jurisprudence {
             background: linear-gradient(160deg, rgba(180,95,6,0.82), rgba(150,70,0,0.78));
@@ -218,7 +218,7 @@
         }
         #popup-tutela-resultado.popup-jurisprudence .popup-timer-bar {
             background: linear-gradient(90deg, rgba(255,183,77,0.6), rgba(255,224,178,0.3));
-            animation: tutela-progress-bar 3.2s linear forwards;
+            animation: tutela-progress-bar 1.6s linear forwards;
         }
         #popup-tutela-resultado.popup-error {
             background: linear-gradient(160deg, rgba(130,20,20,0.82), rgba(100,15,15,0.78));
@@ -230,7 +230,7 @@
         }
         #popup-tutela-resultado.popup-error .popup-timer-bar {
             background: linear-gradient(90deg, rgba(239,83,80,0.6), rgba(255,205,210,0.3));
-            animation: tutela-progress-bar 3.2s linear forwards;
+            animation: tutela-progress-bar 1.6s linear forwards;
         }
         @keyframes tutela-hourglass-spin {
             0% { transform: rotate(0deg) scale(1); }
@@ -410,7 +410,7 @@
             toast.classList.remove('toast-show');
             toast.classList.add('toast-hide');
             setTimeout(() => { toast.style.opacity = '0'; toast.classList.remove('toast-hide'); }, 300);
-        }, 2000);
+        }, 1000);
     }
 
     // ===========================================================================================
@@ -426,7 +426,7 @@
     const keywords =[
         "antecipacao de tutela", "antecipacao da tutela", "tutela antecipada",
         "inaudita altera pars", "altera pars", "pedido liminar", "liminar",
-        "liminares", "antecipacao dos efeitos", "tutela de urgencia", "tutela mandamental de urgencia", "carater antecedente", "tutela provisoria", "art. 300", "artigo 300"
+        "liminares", "antecipacao dos efeitos", "tutela de urgencia", "tutela provisoria", "art. 300", "artigo 300"
     ];
 
     const positiveWords =[
@@ -662,8 +662,8 @@
                 // Exibe notificação clean e objetiva com ampulheta animada
                 showPopup(
                     '⏳',
-                    'Reconhecendo Caracteres do Texto',
-                    'Documento digitalizado ou sem caracteres visíveis<br><b>Aguarde a leitura...</b>',
+                    'Reconhecendo Texto (OCR)',
+                    'Documento digitalizado.<br><b>Aguarde a leitura em imagem...</b>',
                     null,
                     'ocr'
                 );
@@ -976,7 +976,7 @@
         document.body.appendChild(popup);
 
         if (type !== 'ocr') {
-            let timeout = (type === 'success') ? 3600 : 6400; // Dobro do tempo de exibição (3.6s / 6.4s)
+            let timeout = (type === 'success') ? 1800 : 3200; // Metade do tempo de exibição (1.8s / 3.2s)
             setTimeout(() => {
                 popup.classList.add('popup-fadeout');
                 setTimeout(() => { if (popup.parentNode) popup.remove(); }, 300);
@@ -1167,7 +1167,7 @@
     /**
      * Exibe o banner de resultado:
      *   - Apenas banner laranja (AJG)
-     * O banner AJG fica fixo até o usuário fechar manualmente ou expirar o tempo (2.8s).
+     * O banner AJG fica fixo até o usuário fechar manualmente ou expirar o tempo (1.9s).
      */
     function exibirBannersAJG() {
         // Remove container anterior se já existir
@@ -1261,8 +1261,8 @@
             fecharBanner();
         });
 
-        // Fechar automaticamente após 3.8s (tempo similar ao da tutela de urgência + 2s)
-        setTimeout(fecharBanner, 3800);
+        // Fechar automaticamente após 1.9s (metade do tempo)
+        setTimeout(fecharBanner, 1900);
     }
 
     // ===========================================================================================
