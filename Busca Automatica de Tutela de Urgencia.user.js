@@ -2,7 +2,7 @@
 // @name         Busca Automatica de Tutela de Urgencia
 // @namespace    http://tampermonkey.net/
 // @version      8.6
-// @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore + OCR de PDFs digitalizados com cache de cliques
+// @description  Varre a petição inicial em busca de pedido de antecipação de tutela + AJG
 // @author       Allison de Castro Silva
 // @match        https://eproc1g.tjmg.jus.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js
