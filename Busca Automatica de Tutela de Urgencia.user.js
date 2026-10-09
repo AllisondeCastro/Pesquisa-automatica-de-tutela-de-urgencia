@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Busca Automatica de Tutela de Urgencia
 // @namespace    http://tampermonkey.net/
-// @version      8.5
-// @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore + OCR nativo em PDFs digitalizados com cache de cliques
+// @version      8.6
+// @description  Varre a petição inicial em busca de pedido de antecipação de tutela + Cópia rápida de link de documento na árvore + OCR de PDFs digitalizados com cache de cliques
 // @author       Allison de Castro Silva
 // @match        https://eproc1g.tjmg.jus.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js
@@ -578,55 +578,6 @@
     }
 
     /**
-     * Utiliza a busca nativa do navegador (window.find), a qual aciona o motor de OCR nativo
-     * integrado no Chrome/Edge em PDFs digitalizados (o mesmo mecanismo ativado pelo Ctrl+F).
-     */
-    function buscarTextoNativoNavegador(termo) {
-        try {
-            if (typeof window === 'undefined' || typeof window.find !== 'function') return false;
-
-            const sel = window.getSelection ? window.getSelection() : null;
-            const ranges = [];
-            if (sel && sel.rangeCount > 0) {
-                for (let i = 0; i < sel.rangeCount; i++) {
-                    ranges.push(sel.getRangeAt(i).cloneRange());
-                }
-            }
-
-            // window.find(aString, aCaseSensitive, aBackwards, aWrapAround, aWholeWord, aSearchInFrames, aShowDialog)
-            const encontrou = window.find(termo, false, false, true, false, true, false);
-
-            if (sel) {
-                sel.removeAllRanges();
-                ranges.forEach(r => sel.addRange(r));
-            }
-
-            return encontrou;
-        } catch(e) {
-            return false;
-        }
-    }
-
-    /**
-     * Extrai o texto dos elementos DOM/iframes renderizados pelo leitor do navegador.
-     */
-    function extrairTextoDosFrames() {
-        let textoTotal = "";
-        try {
-            const frames = document.querySelectorAll('iframe, frame, embed, object');
-            frames.forEach(f => {
-                try {
-                    const doc = f.contentDocument || f.contentWindow?.document;
-                    if (doc && doc.body) {
-                        textoTotal += " " + (doc.body.innerText || doc.body.textContent || "");
-                    }
-                } catch(e) {}
-            });
-        } catch(e) {}
-        return textoTotal;
-    }
-
-    /**
      * Obter a instância do Tesseract.js (pré-carregada via @require ou dinâmica).
      */
     async function obterTesseract() {
@@ -702,22 +653,23 @@
                         textNorm: textNorm
                     });
 
-                    // Verificar AJG
+                    // Verificar AJG (busca com limites de palavra para evitar falsos positivos)
                     if (!ajgEncontrado) {
                         for (const termo of ajgTermos) {
-                            const termoNorm = termo.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-                            if (textNorm.includes(termoNorm)) {
+                            for (const m of buscarTolerante(textNorm, termo, 0, 5)) {
+                                if (matchAJGfalsoPositivo(textNorm, termo, m)) continue;
                                 ajgEncontrado = true;
                                 break;
                             }
+                            if (ajgEncontrado) break;
                         }
                     }
 
-                    // Verificar Tutela de Urgência
+                    // Verificar Tutela de Urgência (busca com limites de palavra:
+                    // evita, p. ex., "liminar" casar dentro de "preliminar")
                     if (!tutelaMatch) {
                         for (const kw of keywords) {
-                            const kwNorm = kw.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-                            if (textNorm.includes(kwNorm)) {
+                            if (buscarTolerante(textNorm, kw, 0, 1).length > 0) {
                                 tutelaMatch = { match: kw, page: pageNum, score: 10, charIndex: 0 };
                                 break;
                             }
@@ -923,11 +875,6 @@
             // Se nenhuma página extraiu texto pesquisável (PDF contendo apenas imagens ou digitalizado),
             // executa o OCR via Tesseract.js diretamente sobre o canvas renderizado da página.
             if (totalTextItems === 0 || totalTextChars < 30) {
-                for (const kw of keywords) {
-                    if (buscarTextoNativoNavegador(kw)) {
-                        return { match: kw, page: 1, score: 10, charIndex: 0 };
-                    }
-                }
                 const resOCR = await executarOCRnoPDF(pdf);
                 if (resOCR && resOCR.tutelaMatch) {
                     return resOCR.tutelaMatch;
@@ -989,8 +936,7 @@
     // (Independente da busca de tutela — roda uma vez, varre o PDF inteiro)
     // ===========================================================================================
 
-    // Termos aceitos (serão normalizados sem acentos na comparação)
-    // Termos aceitos para busca de AJG (no PDF e na Árvore de Documentos)
+    // Termos aceitos para busca de AJG (exclusivamente no arquivo PDF)
     const ajgTermos = [
         "assistencia judiciaria gratuita",
         "assistencia juridica gratuita",
@@ -1021,98 +967,47 @@
     ];
 
     /**
-     * Varre a Árvore de Documentos (#divArvore) em busca de termos de AJG / Hipossuficiência / Assistência Jurídica.
-     * Procura no documento atual, window.top, window.parent e em todos os frames acessíveis do eproc.
+     * Retorna o trecho contínuo de caracteres alfanuméricos a partir de `ini`
+     * (ignora espaços, pontuação e quebras), útil para inspecionar texto pós-match.
      */
-    function verificarAJGnaArvore() {
-        try {
-            const tentarEncontrar = (win) => {
-                if (!win) return null;
-                try {
-                    const doc = win.document;
-                    if (!doc) return null;
-                    let el = doc.getElementById('divArvore') || doc.querySelector('#divArvore, .jstree, [id*="Arvore"]');
-                    if (el) return el;
-                } catch(e) {}
-                return null;
-            };
-
-            let elArvore = tentarEncontrar(window) || tentarEncontrar(window.top) || tentarEncontrar(window.parent);
-
-            if (!elArvore) {
-                try {
-                    const frames = (window.top || window).frames;
-                    for (let i = 0; i < frames.length; i++) {
-                        elArvore = tentarEncontrar(frames[i]);
-                        if (elArvore) break;
-                    }
-                } catch(e) {}
-            }
-
-            if (!elArvore) return false;
-
-            const textoArvore = (elArvore.innerText || elArvore.textContent || '')
-                .normalize("NFD")
-                .replace(/[\u0300-\u036f]/g, "")
-                .toLowerCase();
-
-            if (!textoArvore.trim()) return false;
-
-            for (const termo of ajgTermos) {
-                const termoNorm = termo.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-                if (textoArvore.includes(termoNorm)) return true;
-                if (buscarTolerante(textoArvore, termoNorm, 0, 1).length > 0) return true;
-            }
-        } catch(e) {
-            console.error("Erro ao verificar AJG na Árvore de Documentos:", e);
+    function trechoAlnum(texto, ini, maxLen) {
+        let out = '';
+        for (let i = Math.max(0, ini); i < texto.length && out.length < maxLen; i++) {
+            const c = texto[i];
+            if (/[a-z0-9]/.test(c)) out += c;
         }
-        return false;
+        return out;
     }
 
     /**
-     * Realiza a verificação completa de AJG:
-     * 1) Checa a Árvore de Documentos (#divArvore).
-     * 2) Checa o texto renderizado nos frames/DOM pelo leitor do navegador.
-     * 3) Utiliza o mecanismo de busca/OCR nativo do navegador via window.find (mesmo motor do Ctrl+F).
-     * 4) Varre as páginas do PDF via PDF.js.
-     * 5) Em caso de PDF digitalizado sem camada de texto, evita falso alarme (retorna true).
+     * Descarta falsos positivos de AJG no arquivo, como "hipossuficiência técnica" /
+     * "hipossuficiente a parte", termos de inversão do ônus da prova (CDC) que NÃO
+     * representam pedido de gratuidade judiciária.
+     */
+    function matchAJGfalsoPositivo(texto, termo, match) {
+        if (!termo.startsWith('hipossuficien')) return false;
+        const continuacao = trechoAlnum(texto, match.fim, 12);
+        if (continuacao.startsWith('tecnica') || continuacao.startsWith('tecnico')) return true;
+        const janela = trechoAlnum(texto, match.index - 160, 380);
+        return janela.includes('onusdaprova') ||
+               janela.includes('inversaodoonus') ||
+               janela.includes('opejudicis') ||
+               janela.includes('inversaodepjudicis');
+    }
+
+    /**
+     * Realiza a verificação de AJG exclusivamente no arquivo PDF:
+     * 1) Varre as páginas do PDF via PDF.js com busca tolerante (ignora espaçamento entre letras).
+     * 2) Descarta falsos positivos como "hipossuficiência técnica" (inversão do ônus da prova).
+     * 3) Em caso de PDF digitalizado sem camada de texto, executa OCR via Tesseract.js.
      */
     async function verificarAJGnoPDF(url) {
-        // Passo 1: Verificar se a Árvore de Documentos no eproc possui pedido/documento de AJG
-        if (verificarAJGnaArvore()) return true;
-
-        // Passo 2: Extração de texto dos elementos renderizados nos frames/DOM (ex.: leitor PDF)
-        const textoFrames = extrairTextoDosFrames().normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-        if (textoFrames.trim()) {
-            for (const termo of ajgTermos) {
-                const termoNorm = termo.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-                if (textoFrames.includes(termoNorm) || buscarTolerante(textoFrames, termoNorm, 0, 1).length > 0) {
-                    return true;
-                }
-            }
-        }
-
-        // Passo 3: Utilizar motor de busca/OCR nativo do navegador via window.find (mesmo mecanismo do Ctrl+F)
-        const termosNativos = [
-            "justiça gratuita", "justica gratuita", "gratuidade da justiça", "gratuidade da justica",
-            "assistência judiciária", "assistencia judiciaria", "assistência jurídica", "assistencia juridica",
-            "hipossuficiência", "hipossuficiencia", "ajg"
-        ];
-        for (const t of termosNativos) {
-            if (buscarTextoNativoNavegador(t)) return true;
-        }
-
-        // Passo 4: Varredura via PDF.js
+        // Sem acesso à biblioteca de PDF: não é possível analisar o arquivo, evita falso alarme.
         if (typeof pdfjsLib === 'undefined') return true;
         try {
             const cleanUrl = url.split('#')[0];
             const loadingTask = pdfjsLib.getDocument({ url: cleanUrl, withCredentials: true });
             const pdf = await loadingTask.promise;
-
-            const ajgRegex = new RegExp(
-                '(' + ajgTermos.map(t => t.replace(/[^a-z0-9]/gi, '').toLowerCase()).join('|') + ')',
-                'i'
-            );
 
             let totalTextItems = 0;
             let totalTextCharCount = 0;
@@ -1124,21 +1019,9 @@
 
                 totalTextItems += itens.length;
 
-                // 1) Passo original: tudo junto e sem pontuação (pega palavras divididas entre itens)
-                const pageText = itens
-                    .map(item => item.str)
-                    .join('') // Junta tudo para evitar problemas de palavras divididas
-                    .normalize('NFD')
-                    .replace(/[\u0300-\u036f]/g, '') // Remove acentos
-                    .replace(/[^a-z0-9]/gi, '') // Remove todos os espaços, hífens e pontuações
-                    .toLowerCase();
-
-                totalTextCharCount += pageText.length;
-
-                if (ajgRegex.test(pageText)) return true; // AJG encontrado
-
-                // 2) Passo tolerante: texto com espaços, ignorando espaçamento entre letras
-                //    (ex.: "j u s t i ç a") e pequenas corrupções de acentuação (ex.: "justia")
+                // Texto com espaços preservados e normalizado. A busca tolerante ignora
+                // espaçamento entre letras (ex.: "j u s t i ç a") e corrupções de acentuação,
+                // mantendo os limites de palavra (evita casar "ajg" dentro de lixo binário).
                 const pageTextEspacos = itens
                     .map(item => item.str.replace(/\s+/g, ' ') + ' ')
                     .join('')
@@ -1146,8 +1029,13 @@
                     .replace(/[\u0300-\u036f]/g, '')
                     .toLowerCase();
 
+                totalTextCharCount += pageTextEspacos.replace(/[^a-z0-9]/g, '').length;
+
                 for (const termo of ajgTermos) {
-                    if (buscarTolerante(pageTextEspacos, termo, 0, 1).length > 0) return true;
+                    for (const m of buscarTolerante(pageTextEspacos, termo, 0, 5)) {
+                        if (matchAJGfalsoPositivo(pageTextEspacos, termo, m)) continue;
+                        return true; // AJG encontrado no arquivo
+                    }
                 }
             }
 
@@ -1155,10 +1043,12 @@
             if (totalTextItems === 0 || totalTextCharCount < 30) {
                 const resOCR = await executarOCRnoPDF(pdf);
                 if (resOCR && resOCR.ajgEncontrado) return true;
-                return true;
+                // OCR leu o documento com sucesso (totalChars >= 30) e não achou AJG: reporta ausência
+                if (resOCR && resOCR.totalChars >= 30) return false;
+                return true; // Não foi possível ler o documento — evita falso alarme
             }
 
-            return false; // Nenhuma página teve AJG e a árvore também não
+            return false; // Nenhuma página do arquivo possui termo de AJG
         } catch(e) {
             return true; // Erro silencioso — não alarma
         }
@@ -1389,10 +1279,8 @@
                 btn.classList.add('btn-juris');
                 btn.innerHTML = '⚖️';
                 btn.title = `Apenas jurisprudência na pág. ${result.page} (clique para próxima)`;
-                // Atualizar cursor para pular este match de jurisprudência
-                if (isSequential) {
-                    lastFoundCursor = { page: result.page, charIndex: (result.charIndex || 0) + 1 };
-                }
+                // Atualizar cursor para pular este match de jurisprudência (evita repetir a página)
+                lastFoundCursor = { page: result.page, charIndex: (result.charIndex || 0) + 1 };
                 // Se AJG ausente na primeira busca: exibir apenas banner laranja
                 if (ajgAusenteNestaAcao) exibirBannersAJG();
 
@@ -1445,6 +1333,9 @@
             lastFoundCursor = null; // Reset cursor ao trocar de PDF
             ajgJaVerificado = false; // Reset AJG: novo PDF = nova verificação de AJG
             ajgEncontrado = null;
+            // Reset do cache de OCR: evita reutilizar o resultado (AJG/tutela) do PDF anterior
+            ocrCacheData = null;
+            ocrEmAndamento = null;
             if (pdfButtonShown && pdfButtonNode) pdfButtonNode.remove();
             pdfButtonNode = createBottomRightButton();
             pdfButtonShown = true;
